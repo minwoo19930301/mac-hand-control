@@ -29,10 +29,19 @@ swift "$ROOT/Scripts/make_icon.swift" "$ROOT" >/dev/null
 iconutil -c icns "$ROOT/Resources/AppIcon.iconset" -o "$ROOT/Resources/AppIcon.icns"
 cp "$ROOT/Resources/AppIcon.icns" "$RESOURCES_DIR/AppIcon.icns"
 
-codesign \
-  --force \
-  --sign - \
-  --requirements '=designated => identifier "local.codex.MacHandControl"' \
-  "$APP_DIR" >/dev/null
+if [[ -n "${SIGN_IDENTITY:-}" ]]; then
+  codesign \
+    --force \
+    --options runtime \
+    --timestamp \
+    --sign "$SIGN_IDENTITY" \
+    "$APP_DIR" >/dev/null
+else
+  codesign \
+    --force \
+    --sign - \
+    --requirements '=designated => identifier "local.codex.MacHandControl"' \
+    "$APP_DIR" >/dev/null
+fi
 
 echo "$APP_DIR"

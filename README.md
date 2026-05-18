@@ -64,3 +64,27 @@ dist/Mac-Hand-Control.dmg
 ## Distribution
 
 For a smoother public install, the next step is signing with an Apple Developer ID certificate and notarizing the DMG. Without that, the app still works, but macOS will show extra security prompts after download.
+
+### Signed Release
+
+After a `Developer ID Application` certificate is installed in Keychain Access, confirm the signing identity:
+
+```sh
+security find-identity -v -p codesigning
+```
+
+Store Apple notarization credentials once:
+
+```sh
+xcrun notarytool store-credentials "mac-hand-control-notary" \
+  --apple-id "you@example.com" \
+  --team-id "TEAMID"
+```
+
+Then build, sign, notarize, and staple the DMG:
+
+```sh
+SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" \
+NOTARY_PROFILE="mac-hand-control-notary" \
+./release.sh
+```

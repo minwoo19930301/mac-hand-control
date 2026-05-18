@@ -22,4 +22,13 @@ hdiutil create \
   "$DMG_PATH" >/dev/null
 
 rm -rf "$STAGE_DIR"
+
+if [[ -n "${SIGN_IDENTITY:-}" ]]; then
+  codesign \
+    --force \
+    --timestamp \
+    --sign "$SIGN_IDENTITY" \
+    "$DMG_PATH" >/dev/null
+fi
+
 echo "$DMG_PATH"
