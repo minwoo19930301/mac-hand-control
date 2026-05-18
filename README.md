@@ -8,6 +8,10 @@ Native macOS prototype for controlling Spaces and fullscreen with camera hand ge
 
 - Fullscreen: pinch with both hands, keep pinching, then spread or squeeze the two hands. This sends `Control + Command + F` to the app you were using.
 - Switch Space: swipe one open hand horizontally. A left swipe sends `Control + Right`; a right swipe sends `Control + Left`.
+- Move pointer: raise one hand with only the index finger extended. The cursor follows the fingertip.
+- Left click: pinch thumb and index finger with one hand, then release.
+- Right click: pinch thumb, index, and middle finger together with one hand, then release.
+- Scroll: pinch with one hand and move the pinched hand up or down.
 
 The debug panel shows a mirrored camera feed, hand skeletons, yellow thumb-to-index pinch lines, green open-hand markers, and live gesture state for each detected hand.
 
@@ -22,6 +26,16 @@ DMG is the friendlier install path. Open `Mac-Hand-Control.dmg`, then drag `Mac 
 If you download the zip instead, unzip it and move `Mac Hand Control.app` into `Applications`. Open the app, approve camera access, and use the in-app `Enable AX` button to enable Accessibility control.
 
 Because this prototype is ad-hoc signed instead of Developer ID signed and notarized, macOS may ask for approval in Privacy & Security the first time you open a downloaded copy.
+
+If macOS says the app cannot be checked for malicious software:
+
+1. Try to open `Mac Hand Control.app` once.
+2. Open System Settings.
+3. Go to Privacy & Security.
+4. In the Security section, click Open Anyway for Mac Hand Control.
+5. Open the app again and confirm Open.
+
+This manual approval is only needed because the prototype is not notarized. The cleaner distribution path is to sign the app with an Apple Developer ID certificate, enable hardened runtime, submit it to Apple's notary service, staple the notarization ticket, and then build the DMG.
 
 ## Build Locally
 

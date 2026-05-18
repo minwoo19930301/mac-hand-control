@@ -13,6 +13,9 @@ private enum GesturePhase: String {
     case idle
     case pinched = "pinched"
     case swipe = "swipe"
+    case pointer = "pointer"
+    case click = "click"
+    case scroll = "scroll"
     case fired = "fired"
     case cooldown
 }
@@ -100,6 +103,23 @@ private struct GestureSnapshot {
     let handCount: Int
     let details: String
     let canSendKeys: Bool
+
+    func withPointerState(_ pointerState: (GesturePhase?, String?)) -> GestureSnapshot {
+        guard command == .none,
+              let pointerPhase = pointerState.0,
+              let pointerDetails = pointerState.1
+        else {
+            return self
+        }
+
+        return GestureSnapshot(
+            phase: pointerPhase,
+            command: command,
+            handCount: handCount,
+            details: pointerDetails,
+            canSendKeys: canSendKeys
+        )
+    }
 }
 
 private func poseDistance(_ first: CGPoint, _ second: CGPoint) -> CGFloat {
@@ -245,6 +265,173 @@ private struct TimedPoint {
     let point: CGPoint
 }
 
+private func fingerExtended(
+    _ hand: HandPose,
+    tip: VNHumanHandPoseObservation.JointName,
+    pip: VNHumanHandPoseObservation.JointName,
+    mcp: VNHumanHandPoseObservation.JointName
+) -> Bool {
+    guard
+        let wrist = hand.point(.wrist),
+        let tipPoint = hand.point(tip),
+        let pipPoint = hand.point(pip),
+        let mcpPoint = hand.point(mcp)
+    else {
+        return false
+    }
+
+    let palmScale = max(poseDistance(wrist, mcpPoint), 0.001)
+    return poseDistance(wrist, tipPoint) > poseDistance(wrist, pipPoint) + palmScale * 0.12
+}
+
+private func fingerCurled(
+    _ hand: HandPose,
+    tip: VNHumanHandPoseObservation.JointName,
+    pip: VNHumanHandPoseObservation.JointName,
+    mcp: VNHumanHandPoseObservation.JointName
+) -> Bool {
+    guard
+        let wrist = hand.point(.wrist),
+        let tipPoint = hand.point(tip),
+        let pipPoint = hand.point(pip),
+        let mcpPoint = hand.point(mcp)
+    else {
+        return false
+    }
+
+    let palmScale = max(poseDistance(wrist, mcpPoint), 0.001)
+    return poseDistance(wrist, tipPoint) < poseDistance(wrist, pipPoint) + palmScale * 0.15
+}
+
+private func palmWidth(for hand: HandPose) -> CGFloat? {
+    guard let indexMCP = hand.point(.indexMCP),
+          let littleMCP = hand.point(.littleMCP)
+    else {
+        return nil
+    }
+
+    return max(poseDistance(indexMCP, littleMCP), 0.001)
+}
+
+private func isThreeFingerPinchedPose(_ hand: HandPose) -> Bool {
+    guard
+        let thumbTip = hand.point(.thumbTip),
+        let indexTip = hand.point(.indexTip),
+        let middleTip = hand.point(.middleTip),
+        let width = palmWidth(for: hand)
+    else {
+        return false
+    }
+
+    return poseDistance(thumbTip, indexTip) < width * 0.58
+        && poseDistance(thumbTip, middleTip) < width * 0.64
+        && poseDistance(indexTip, middleTip) < width * 0.70
+}
+
+private func isIndexPointerPose(_ hand: HandPose) -> Bool {
+    fingerExtended(hand, tip: .indexTip, pip: .indexPIP, mcp: .indexMCP)
+        && fingerCurled(hand, tip: .middleTip, pip: .middlePIP, mcp: .middleMCP)
+        && fingerCurled(hand, tip: .ringTip, pip: .ringPIP, mcp: .ringMCP)
+        && fingerCurled(hand, tip: .littleTip, pip: .littlePIP, mcp: .littleMCP)
+        && !isPinchedPose(hand)
+}
+
+private enum PointerPinchKind {
+    case leftClick
+    case rightClick
+}
+
+private final class PointerGestureController {
+    private let actionRunner: MacActionRunner
+    private var activePinch: PointerPinchKind?
+    private var pinchStartedAt: CFTimeInterval = 0
+    private var pinchStartPoint: CGPoint?
+    private var lastPinchPoint: CGPoint?
+    private var didScrollDuringPinch = false
+    private var lastMoveAt: CFTimeInterval = 0
+
+    init(actionRunner: MacActionRunner) {
+        self.actionRunner = actionRunner
+    }
+
+    func update(hands: [HandPose], now: CFTimeInterval = CACurrentMediaTime()) -> (GesturePhase?, String?) {
+        guard hands.count == 1, let hand = hands.first else {
+            resetPinch()
+            return (nil, nil)
+        }
+
+        let displayedIndexTip = hand.point(.indexTip).map(displayPoint)
+        let threePinch = isThreeFingerPinchedPose(hand)
+        let twoPinch = isPinchedPose(hand) && !threePinch
+
+        if threePinch || twoPinch, let point = displayedIndexTip {
+            let kind: PointerPinchKind = threePinch ? .rightClick : .leftClick
+            if activePinch != kind {
+                activePinch = kind
+                pinchStartedAt = now
+                pinchStartPoint = point
+                lastPinchPoint = point
+                didScrollDuringPinch = false
+            } else {
+                handlePinchDrag(point, now: now)
+            }
+
+            actionRunner.moveCursor(to: point)
+            return (didScrollDuringPinch ? .scroll : .click, threePinch ? "three-finger pinch: right click" : "pinch drag: click / scroll")
+        }
+
+        if let activePinch, let start = pinchStartPoint, let last = lastPinchPoint {
+            let distance = poseDistance(start, last)
+            let heldLongEnough = now - pinchStartedAt > 0.06
+            if heldLongEnough && !didScrollDuringPinch && distance < 0.055 {
+                switch activePinch {
+                case .leftClick:
+                    actionRunner.leftClick()
+                case .rightClick:
+                    actionRunner.rightClick()
+                }
+                resetPinch()
+                return (.fired, activePinch == .leftClick ? "left click" : "right click")
+            }
+            resetPinch()
+        }
+
+        if isIndexPointerPose(hand), let point = displayedIndexTip {
+            if now - lastMoveAt > 1.0 / 50.0 {
+                actionRunner.moveCursor(to: point)
+                lastMoveAt = now
+            }
+            return (.pointer, "index pointer: move cursor")
+        }
+
+        return (nil, nil)
+    }
+
+    private func handlePinchDrag(_ point: CGPoint, now: CFTimeInterval) {
+        guard let last = lastPinchPoint else {
+            lastPinchPoint = point
+            return
+        }
+
+        let dy = point.y - last.y
+        lastPinchPoint = point
+
+        guard abs(dy) > 0.018 else {
+            return
+        }
+
+        didScrollDuringPinch = true
+        actionRunner.scroll(verticalDelta: dy)
+    }
+
+    private func resetPinch() {
+        activePinch = nil
+        pinchStartPoint = nil
+        lastPinchPoint = nil
+        didScrollDuringPinch = false
+    }
+}
+
 private final class GestureDetector {
     private var phase: GesturePhase = .idle
     private var armedAt: CFTimeInterval = 0
@@ -364,7 +551,7 @@ private final class GestureDetector {
         case .swipe:
             details = "swipe open hand"
         default:
-            details = "pinch spread / open-hand swipe"
+            details = "pinch spread / open-hand swipe / index pointer"
         }
         return (snapshot(hands: hands, details: details), nil)
     }
@@ -779,6 +966,8 @@ private final class MacActionRunner {
         AXIsProcessTrusted()
     }
 
+    private var lastCursorPoint: CGPoint?
+
     func requestAccessibilityIfNeeded() {
         guard !Self.hasAccessibilityPermission else {
             return
@@ -919,6 +1108,88 @@ private final class MacActionRunner {
         }
     }
 
+    func moveCursor(to normalizedPoint: CGPoint) {
+        guard Self.hasAccessibilityPermission,
+              let screenPoint = screenPoint(from: normalizedPoint)
+        else {
+            requestAccessibilityIfNeeded()
+            return
+        }
+
+        let smoothed: CGPoint
+        if let lastCursorPoint {
+            smoothed = CGPoint(
+                x: lastCursorPoint.x + (screenPoint.x - lastCursorPoint.x) * 0.34,
+                y: lastCursorPoint.y + (screenPoint.y - lastCursorPoint.y) * 0.34
+            )
+        } else {
+            smoothed = screenPoint
+        }
+
+        lastCursorPoint = smoothed
+        CGWarpMouseCursorPosition(smoothed)
+        CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
+    }
+
+    func leftClick() {
+        click(typeDown: .leftMouseDown, typeUp: .leftMouseUp, button: .left)
+    }
+
+    func rightClick() {
+        click(typeDown: .rightMouseDown, typeUp: .rightMouseUp, button: .right)
+    }
+
+    func scroll(verticalDelta: CGFloat) {
+        guard Self.hasAccessibilityPermission else {
+            requestAccessibilityIfNeeded()
+            return
+        }
+
+        let amount = Int32(max(min(verticalDelta * 2200, 90), -90))
+        guard amount != 0 else {
+            return
+        }
+
+        let event = CGEvent(
+            scrollWheelEvent2Source: CGEventSource(stateID: .hidSystemState),
+            units: .pixel,
+            wheelCount: 1,
+            wheel1: amount,
+            wheel2: 0,
+            wheel3: 0
+        )
+        event?.post(tap: .cghidEventTap)
+    }
+
+    private func click(typeDown: CGEventType, typeUp: CGEventType, button: CGMouseButton) {
+        guard Self.hasAccessibilityPermission else {
+            requestAccessibilityIfNeeded()
+            return
+        }
+
+        let location = CGEvent(source: nil)?.location ?? lastCursorPoint ?? NSEvent.mouseLocation
+        let source = CGEventSource(stateID: .hidSystemState)
+        let down = CGEvent(mouseEventSource: source, mouseType: typeDown, mouseCursorPosition: location, mouseButton: button)
+        let up = CGEvent(mouseEventSource: source, mouseType: typeUp, mouseCursorPosition: location, mouseButton: button)
+        down?.post(tap: .cghidEventTap)
+        Thread.sleep(forTimeInterval: 0.04)
+        up?.post(tap: .cghidEventTap)
+    }
+
+    private func screenPoint(from normalizedPoint: CGPoint) -> CGPoint? {
+        guard let screen = NSScreen.main else {
+            return nil
+        }
+
+        let clampedX = min(max(normalizedPoint.x, 0), 1)
+        let clampedY = min(max(normalizedPoint.y, 0), 1)
+        let frame = screen.frame
+        return CGPoint(
+            x: frame.minX + clampedX * frame.width,
+            y: frame.maxY - clampedY * frame.height
+        )
+    }
+
     private func pressHotKey(keyCode: CGKeyCode, flags: CGEventFlags) {
         let source = CGEventSource(stateID: .hidSystemState)
         var modifierKeyCodes: [CGKeyCode] = []
@@ -999,6 +1270,7 @@ private final class HandTracker: NSObject, AVCaptureVideoDataOutputSampleBufferD
     private let queue = DispatchQueue(label: "local.codex.hand-control.camera")
     private let detector = GestureDetector()
     private let actionRunner = MacActionRunner()
+    private lazy var pointerController = PointerGestureController(actionRunner: actionRunner)
     private var lastFrameAt: CFTimeInterval = 0
     private var hasPublishedFirstFrame = false
 
@@ -1108,12 +1380,13 @@ private final class HandTracker: NSObject, AVCaptureVideoDataOutputSampleBufferD
             try handler.perform([request])
             let hands = (request.results ?? []).compactMap(makeHandPose)
             let (snapshot, command) = detector.update(hands: hands, now: now)
+            let pointerState = pointerController.update(hands: hands, now: now)
 
             if let command {
                 actionRunner.run(command)
             }
 
-            publish(hands: hands, snapshot: snapshot)
+            publish(hands: hands, snapshot: snapshot.withPointerState(pointerState))
         } catch {
             publish(hands: [], snapshot: GestureSnapshot(phase: .idle, command: .none, handCount: 0, details: "vision failed", canSendKeys: MacActionRunner.hasAccessibilityPermission))
         }
@@ -1409,7 +1682,10 @@ private final class StatusOverlayView: NSView {
 
         return hands.enumerated()
             .map { index, hand in
-                "H\(index + 1): open \(isSwipeOpenPose(hand) ? "yes" : "no") / pinch \(isGesturePinchedPose(hand) ? "yes" : "no")"
+                let pointer = isIndexPointerPose(hand) ? "yes" : "no"
+                let pinch = isGesturePinchedPose(hand) ? "yes" : "no"
+                let three = isThreeFingerPinchedPose(hand) ? "yes" : "no"
+                return "H\(index + 1): point \(pointer) / pinch \(pinch) / 3pinch \(three)"
             }
             .joined(separator: "  ")
     }
