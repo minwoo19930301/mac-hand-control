@@ -2,9 +2,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-DMG_PATH="$ROOT/dist/Mac-Hand-Control.dmg"
-ZIP_PATH="$ROOT/dist/Mac-Hand-Control.zip"
-APP_PATH="$ROOT/build/Mac Hand Control.app"
+DMG_PATH="$ROOT/dist/Mac-Hand-Controller.dmg"
+ZIP_PATH="$ROOT/dist/Mac-Hand-Controller.zip"
+APP_PATH="$ROOT/build/Mac Hand Controller.app"
 
 if [[ -z "${SIGN_IDENTITY:-}" ]]; then
   echo "Set SIGN_IDENTITY to your Developer ID Application identity." >&2

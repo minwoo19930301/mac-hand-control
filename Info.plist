@@ -13,17 +13,17 @@
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>Mac Hand Control</string>
+	<string>Mac Hand Controller</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.1.0</string>
+	<string>0.3.0</string>
 	<key>CFBundleVersion</key>
 	<string>1</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
 	<key>NSCameraUsageDescription</key>
-	<string>Mac Hand Control uses the camera to recognize hand gestures for local macOS control.</string>
+	<string>Mac Hand Controller uses the camera to recognize hand gestures for local macOS control.</string>
 	<key>NSHumanReadableCopyright</key>
 	<string>Prototype</string>
 	<key>NSPrincipalClass</key>
