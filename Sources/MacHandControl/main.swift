@@ -142,6 +142,7 @@ private final class GesturePreferences {
         static let fullscreen = "gestures.fullscreen.enabled"
         static let space = "gestures.space.enabled"
         static let split = "gestures.split.enabled"
+        static let gestureSensitivity = "gestures.sensitivity"
         static let pointerSensitivity = "gestures.pointer.sensitivity"
         static let scrollSensitivity = "gestures.scroll.sensitivity"
     }
@@ -174,6 +175,11 @@ private final class GesturePreferences {
     var splitEnabled: Bool {
         get { bool(for: Key.split, defaultValue: true) }
         set { set(newValue, for: Key.split) }
+    }
+
+    var gestureSensitivity: Double {
+        get { double(for: Key.gestureSensitivity, defaultValue: 1.55) }
+        set { set(clamp(newValue, min: 0.60, max: 8.00), for: Key.gestureSensitivity) }
     }
 
     var pointerSensitivity: Double {
@@ -297,6 +303,19 @@ private func displayPoint(_ point: CGPoint) -> CGPoint {
 
 private func displayCenter(for hand: HandPose) -> CGPoint? {
     hand.center.map(displayPoint)
+}
+
+private func thumbIndexAnchorPoint(for hand: HandPose) -> CGPoint? {
+    guard let thumbTip = hand.point(.thumbTip),
+          let indexTip = hand.point(.indexTip)
+    else {
+        return nil
+    }
+
+    return CGPoint(
+        x: (thumbTip.x + indexTip.x) / 2,
+        y: (thumbTip.y + indexTip.y) / 2
+    )
 }
 
 private final class OverlayWindowRegistry {
@@ -523,30 +542,38 @@ private func isThreeFingerPinchedPose(_ hand: HandPose) -> Bool {
 }
 
 private func isIndexPointerPose(_ hand: HandPose) -> Bool {
-    isBareIndexPointerPose(hand) && !isPinchedPose(hand) && !isFistPose(hand)
+    isThumbIndexPointerPose(hand) && !isPinchedPose(hand) && !isFistPose(hand)
 }
 
-private func isPointerClickPose(_ hand: HandPose) -> Bool {
-    isPinchedPose(hand) && isBareIndexPointerPose(hand)
-}
-
-private func isBareIndexPointerPose(_ hand: HandPose) -> Bool {
+private func isThumbIndexPointerPose(_ hand: HandPose) -> Bool {
     guard
         let wrist = hand.point(.wrist),
+        let thumbTip = hand.point(.thumbTip),
+        let thumbIP = hand.point(.thumbIP),
+        let thumbMP = hand.point(.thumbMP),
         let indexTip = hand.point(.indexTip),
+        let indexMCP = hand.point(.indexMCP),
+        let littleMCP = hand.point(.littleMCP),
         fingerExtended(hand, tip: .indexTip, pip: .indexPIP, mcp: .indexMCP)
     else {
         return false
     }
 
+    let palmWidth = max(poseDistance(indexMCP, littleMCP), 0.001)
     let indexTipDistance = poseDistance(wrist, indexTip)
+    let thumbIndexDistance = poseDistance(thumbTip, indexTip)
+    let thumbReach = poseDistance(thumbTip, thumbMP)
+    let thumbAwayFromPalm = poseDistance(thumbTip, indexMCP) > palmWidth * 0.75
+    let thumbOpen = thumbIndexDistance > palmWidth * 1.05
+        && thumbReach > poseDistance(thumbIP, thumbMP) + palmWidth * 0.18
+        && thumbAwayFromPalm
     let foldedOtherFingers = [
         fingerNotExtendedForPointer(hand, tip: .middleTip, pip: .middlePIP, mcp: .middleMCP, indexTipDistance: indexTipDistance),
         fingerNotExtendedForPointer(hand, tip: .ringTip, pip: .ringPIP, mcp: .ringMCP, indexTipDistance: indexTipDistance),
         fingerNotExtendedForPointer(hand, tip: .littleTip, pip: .littlePIP, mcp: .littleMCP, indexTipDistance: indexTipDistance)
     ].filter { $0 }.count
 
-    return foldedOtherFingers >= 2
+    return thumbOpen && foldedOtherFingers >= 2
 }
 
 private enum PrimaryHandGesture {
@@ -588,10 +615,6 @@ private enum PrimaryHandGesture {
 }
 
 private func primaryGesture(for hand: HandPose) -> PrimaryHandGesture {
-    if isPointerClickPose(hand) {
-        return .pointerPinch
-    }
-
     if isFistPose(hand) {
         return .fist
     }
@@ -617,8 +640,12 @@ private final class PointerGestureController {
     private let pointerGraceDuration: CFTimeInterval = 0.10
     private let pointerHoldDuration: CFTimeInterval = 0.80
     private let doublePinchInterval: CFTimeInterval = 0.36
+    private let dragHoldDuration: CFTimeInterval = 1.50
+    private let handScaleReference: CGFloat = 0.16
 
     private var wasPointerPinching = false
+    private var pointerPinchStartedAt: CFTimeInterval = 0
+    private var isDragging = false
     private var lastPinchReleaseAt: CFTimeInterval?
     private var pendingSingleClick: DispatchWorkItem?
 
@@ -629,6 +656,12 @@ private final class PointerGestureController {
     private var pointerFrozenUntil: CFTimeInterval = 0
     private var filteredPointerPoint: CGPoint?
     private var lastSentPointerPoint: CGPoint?
+    private var lastStableCursorPoint: CGPoint?
+    private var lastStableCursorPointAt: CFTimeInterval = 0
+    private var activeClickPoint: CGPoint?
+    private var pendingSingleClickPoint: CGPoint?
+    private var calibratedHandScale: CGFloat?
+    private var currentGestureSensitivity: CGFloat = CGFloat(GesturePreferences.shared.gestureSensitivity)
 
     private var isScrollingFist = false
     private var fistStartedAt: CFTimeInterval = 0
@@ -645,11 +678,13 @@ private final class PointerGestureController {
             resetPointer()
             resetFistScroll()
             finishPointerPinch(now: now)
+            resetDistanceCalibration()
             return (nil, nil)
         }
 
         var phase: GesturePhase? = nil
         var details: String? = nil
+        let gestureSensitivity = calibratedGestureSensitivity(for: hand)
 
         let pointerPose = isIndexPointerPose(hand)
         let pinchPose = isPinchedPose(hand)
@@ -657,23 +692,33 @@ private final class PointerGestureController {
             strictPointerLastSeenAt = now
         }
 
-        let clickPinchPose = pinchPose && (wasPointerPinching || now - strictPointerLastSeenAt <= pointerHoldDuration)
-        let canHoldPointer = !pinchPose && now - strictPointerLastSeenAt <= pointerHoldDuration
-        let shouldTrackPointer = now >= pointerFrozenUntil && (pointerPose || (canHoldPointer && hand.point(.indexTip) != nil))
+        let hasRecentPointerAnchor = lastStableCursorPoint != nil
+            && now - lastStableCursorPointAt <= pointerHoldDuration
+        let clickPinchPose = pinchPose
+            && (wasPointerPinching || (hasRecentPointerAnchor && now - strictPointerLastSeenAt <= pointerHoldDuration))
+        let shouldTrackPointer = now >= pointerFrozenUntil && pointerPose
         let fistPose = (isFistPose(hand) || (pinchPose && !clickPinchPose)) && !shouldTrackPointer
 
         if clickPinchPose {
+            if !wasPointerPinching {
+                activeClickPoint = lastStableCursorPoint
+                pointerPinchStartedAt = now
+            }
             resetPointer()
             resetFistScroll()
             wasPointerPinching = true
             pointerFrozenUntil = max(pointerFrozenUntil, now + 0.20)
             phase = .click
             details = "pinch: click"
+            if now - pointerPinchStartedAt >= dragHoldDuration {
+                startOrUpdateDrag(hand: hand, sensitivity: gestureSensitivity)
+                details = "pinch hold: drag"
+            }
         } else {
             finishPointerPinch(now: now)
         }
 
-        if preferences.pointerEnabled, shouldTrackPointer, let point = hand.point(.indexTip).map(displayPoint) {
+        if preferences.pointerEnabled, shouldTrackPointer, let point = thumbIndexAnchorPoint(for: hand).map(displayPoint) {
             resetFistScroll()
             pointerLastSeenAt = now
             pointerStableFrames = min(pointerStableFrames + 1, requiredPointerStableFrames)
@@ -681,19 +726,22 @@ private final class PointerGestureController {
                 if now - lastMoveAt > 1.0 / 50.0 {
                     let filtered = filteredPointer(for: point)
                     if shouldSendPointer(filtered) {
-                        actionRunner.moveCursor(to: filtered)
+                        if let cursorPoint = actionRunner.moveCursor(to: filtered, sensitivity: gestureSensitivity) {
+                            lastStableCursorPoint = cursorPoint
+                            lastStableCursorPointAt = now
+                        }
                         lastSentPointerPoint = filtered
                     }
                     lastMoveAt = now
                 }
                 if phase == nil {
                     phase = .pointer
-                    details = "index pointer: move cursor"
+                    details = "thumb-index pointer: move cursor"
                 }
             } else {
                 if phase == nil {
                     phase = .pointer
-                    details = "hold index pointer"
+                    details = "hold thumb-index pointer"
                 }
             }
         } else if !clickPinchPose, now - pointerLastSeenAt > pointerGraceDuration {
@@ -702,7 +750,7 @@ private final class PointerGestureController {
 
         if preferences.scrollEnabled, fistPose, let center = displayCenter(for: hand) {
             resetPointer()
-            handleFistScroll(center, now: now)
+            handleFistScroll(center, now: now, sensitivity: gestureSensitivity)
             phase = .scroll
             details = "fist: scroll"
         } else {
@@ -719,6 +767,18 @@ private final class PointerGestureController {
 
         wasPointerPinching = false
         pointerFrozenUntil = max(pointerFrozenUntil, now + doublePinchInterval + 0.12)
+        let clickPoint = activeClickPoint ?? lastStableCursorPoint
+        activeClickPoint = nil
+        pointerPinchStartedAt = 0
+        if isDragging {
+            actionRunner.endDrag()
+            isDragging = false
+            pendingSingleClick?.cancel()
+            pendingSingleClick = nil
+            pendingSingleClickPoint = nil
+            lastPinchReleaseAt = nil
+            return
+        }
         guard preferences.clicksEnabled else {
             return
         }
@@ -726,26 +786,31 @@ private final class PointerGestureController {
         if let lastPinchReleaseAt, now - lastPinchReleaseAt <= doublePinchInterval {
             pendingSingleClick?.cancel()
             pendingSingleClick = nil
+            let rightClickPoint = clickPoint ?? pendingSingleClickPoint
+            pendingSingleClickPoint = nil
             self.lastPinchReleaseAt = nil
-            actionRunner.rightClick()
+            actionRunner.rightClick(at: rightClickPoint)
             return
         }
 
         lastPinchReleaseAt = now
+        let scheduledClickPoint = clickPoint
+        pendingSingleClickPoint = scheduledClickPoint
         let click = DispatchWorkItem { [weak self] in
             guard let self else {
                 return
             }
 
-            self.actionRunner.leftClick()
+            self.actionRunner.leftClick(at: scheduledClickPoint)
             self.pendingSingleClick = nil
+            self.pendingSingleClickPoint = nil
             self.lastPinchReleaseAt = nil
         }
         pendingSingleClick = click
         DispatchQueue.main.asyncAfter(deadline: .now() + doublePinchInterval, execute: click)
     }
 
-    private func handleFistScroll(_ point: CGPoint, now: CFTimeInterval) {
+    private func handleFistScroll(_ point: CGPoint, now: CFTimeInterval, sensitivity: CGFloat) {
         guard let last = lastFistPoint else {
             isScrollingFist = true
             fistStartedAt = now
@@ -772,13 +837,50 @@ private final class PointerGestureController {
 
         lockedScrollDirection = direction
         lockedScrollDirectionUntil = now + 0.50
-        actionRunner.scroll(verticalDelta: dy)
+        actionRunner.scroll(verticalDelta: dy, sensitivity: sensitivity)
+    }
+
+    private func startOrUpdateDrag(hand: HandPose, sensitivity: CGFloat) {
+        guard let point = thumbIndexAnchorPoint(for: hand).map(displayPoint) else {
+            return
+        }
+
+        if !isDragging {
+            actionRunner.beginDrag(at: activeClickPoint ?? lastStableCursorPoint)
+            isDragging = true
+        }
+
+        if let cursorPoint = actionRunner.drag(to: point, sensitivity: sensitivity) {
+            lastStableCursorPoint = cursorPoint
+            lastStableCursorPointAt = CACurrentMediaTime()
+        }
     }
 
     private func resetPointer() {
         pointerStableFrames = 0
         filteredPointerPoint = nil
         lastSentPointerPoint = nil
+    }
+
+    private func resetDistanceCalibration() {
+        calibratedHandScale = nil
+        currentGestureSensitivity = CGFloat(preferences.gestureSensitivity)
+    }
+
+    private func calibratedGestureSensitivity(for hand: HandPose) -> CGFloat {
+        if calibratedHandScale == nil, let scale = palmWidth(for: hand) {
+            calibratedHandScale = scale
+        }
+
+        let base = CGFloat(preferences.gestureSensitivity)
+        guard let calibratedHandScale else {
+            currentGestureSensitivity = base
+            return base
+        }
+
+        let distanceMultiplier = min(max(pow(calibratedHandScale / handScaleReference, 0.65), 0.65), 1.75)
+        currentGestureSensitivity = base * distanceMultiplier
+        return currentGestureSensitivity
     }
 
     private func resetFistScroll() {
@@ -927,7 +1029,7 @@ private final class GestureDetector {
         case .swipe:
             details = "open swipe"
         default:
-            details = "pinch fullscreen / one-hand space / index pointer"
+            details = "pinch fullscreen / one-hand space / thumb-index pointer"
         }
         return (snapshot(hands: hands, details: details), nil)
     }
@@ -1590,13 +1692,14 @@ private final class MacActionRunner {
         }
     }
 
-    func moveCursor(to normalizedPoint: CGPoint) {
+    @discardableResult
+    func moveCursor(to normalizedPoint: CGPoint, sensitivity: CGFloat? = nil) -> CGPoint? {
         guard Self.hasAccessibilityPermission,
               let screenPoint = screenPoint(from: normalizedPoint),
               let screen = NSScreen.main
         else {
             requestAccessibilityIfNeeded()
-            return
+            return nil
         }
 
         let smoothed: CGPoint
@@ -1604,7 +1707,7 @@ private final class MacActionRunner {
             let distance = hypot(screenPoint.x - lastCursorPoint.x, screenPoint.y - lastCursorPoint.y)
             let screenScale = max(screen.frame.width, screen.frame.height)
             let normalizedDistance = min(max(distance / max(screenScale * 0.20, 1), 0), 1)
-            let sensitivity = CGFloat(GesturePreferences.shared.pointerSensitivity)
+            let sensitivity = sensitivity ?? CGFloat(GesturePreferences.shared.gestureSensitivity)
             let acceleration = pow(normalizedDistance, 1.35)
             let response = min(max((0.08 + acceleration * 0.78) * sensitivity / 1.42, 0.08), 0.92)
             smoothed = CGPoint(
@@ -1618,24 +1721,78 @@ private final class MacActionRunner {
         lastCursorPoint = smoothed
         CGWarpMouseCursorPosition(smoothed)
         CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
+        return smoothed
     }
 
-    func leftClick() {
-        click(typeDown: .leftMouseDown, typeUp: .leftMouseUp, button: .left)
-    }
-
-    func rightClick() {
-        click(typeDown: .rightMouseDown, typeUp: .rightMouseUp, button: .right)
-    }
-
-    func scroll(verticalDelta: CGFloat) {
+    func beginDrag(at location: CGPoint?) {
         guard Self.hasAccessibilityPermission else {
             requestAccessibilityIfNeeded()
             return
         }
 
-        let sensitivity = CGFloat(GesturePreferences.shared.scrollSensitivity)
-        let amount = Int32(max(min(verticalDelta * 4800 * sensitivity, 520), -520))
+        let location = location ?? CGEvent(source: nil)?.location ?? lastCursorPoint ?? NSEvent.mouseLocation
+        lastCursorPoint = location
+        CGWarpMouseCursorPosition(location)
+        CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
+
+        let source = CGEventSource(stateID: .hidSystemState)
+        let down = CGEvent(mouseEventSource: source, mouseType: .leftMouseDown, mouseCursorPosition: location, mouseButton: .left)
+        down?.post(tap: .cghidEventTap)
+    }
+
+    @discardableResult
+    func drag(to normalizedPoint: CGPoint, sensitivity: CGFloat? = nil) -> CGPoint? {
+        guard Self.hasAccessibilityPermission else {
+            requestAccessibilityIfNeeded()
+            return nil
+        }
+
+        guard let location = moveCursor(to: normalizedPoint, sensitivity: sensitivity) else {
+            return nil
+        }
+
+        let source = CGEventSource(stateID: .hidSystemState)
+        let drag = CGEvent(mouseEventSource: source, mouseType: .leftMouseDragged, mouseCursorPosition: location, mouseButton: .left)
+        drag?.post(tap: .cghidEventTap)
+        return location
+    }
+
+    func endDrag() {
+        guard Self.hasAccessibilityPermission else {
+            requestAccessibilityIfNeeded()
+            return
+        }
+
+        let location = CGEvent(source: nil)?.location ?? lastCursorPoint ?? NSEvent.mouseLocation
+        let source = CGEventSource(stateID: .hidSystemState)
+        let up = CGEvent(mouseEventSource: source, mouseType: .leftMouseUp, mouseCursorPosition: location, mouseButton: .left)
+        up?.post(tap: .cghidEventTap)
+    }
+
+    func leftClick() {
+        leftClick(at: nil)
+    }
+
+    func leftClick(at location: CGPoint?) {
+        click(typeDown: .leftMouseDown, typeUp: .leftMouseUp, button: .left, at: location)
+    }
+
+    func rightClick() {
+        rightClick(at: nil)
+    }
+
+    func rightClick(at location: CGPoint?) {
+        click(typeDown: .rightMouseDown, typeUp: .rightMouseUp, button: .right, at: location)
+    }
+
+    func scroll(verticalDelta: CGFloat, sensitivity: CGFloat? = nil) {
+        guard Self.hasAccessibilityPermission else {
+            requestAccessibilityIfNeeded()
+            return
+        }
+
+        let sensitivity = sensitivity ?? CGFloat(GesturePreferences.shared.gestureSensitivity)
+        let amount = Int32(max(min(verticalDelta * 4800 * sensitivity, 1200), -1200))
         guard amount != 0 else {
             return
         }
@@ -1651,13 +1808,19 @@ private final class MacActionRunner {
         event?.post(tap: .cghidEventTap)
     }
 
-    private func click(typeDown: CGEventType, typeUp: CGEventType, button: CGMouseButton) {
+    private func click(typeDown: CGEventType, typeUp: CGEventType, button: CGMouseButton, at fixedLocation: CGPoint? = nil) {
         guard Self.hasAccessibilityPermission else {
             requestAccessibilityIfNeeded()
             return
         }
 
-        let location = CGEvent(source: nil)?.location ?? lastCursorPoint ?? NSEvent.mouseLocation
+        let location = fixedLocation ?? CGEvent(source: nil)?.location ?? lastCursorPoint ?? NSEvent.mouseLocation
+        if fixedLocation != nil {
+            lastCursorPoint = location
+            CGWarpMouseCursorPosition(location)
+            CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
+        }
+
         let source = CGEventSource(stateID: .hidSystemState)
         let down = CGEvent(mouseEventSource: source, mouseType: typeDown, mouseCursorPosition: location, mouseButton: button)
         let up = CGEvent(mouseEventSource: source, mouseType: typeUp, mouseCursorPosition: location, mouseButton: button)
@@ -1671,11 +1834,8 @@ private final class MacActionRunner {
             return nil
         }
 
-        let visibleRect = CameraDisplayState.shared.visibleNormalizedRect
-        let expandedX = visibleRect.width > 0.05 ? (normalizedPoint.x - visibleRect.minX) / visibleRect.width : normalizedPoint.x
-        let expandedY = visibleRect.height > 0.05 ? (normalizedPoint.y - visibleRect.minY) / visibleRect.height : normalizedPoint.y
-        let clampedX = min(max(expandedX, 0), 1)
-        let clampedY = min(max(expandedY, 0), 1)
+        let clampedX = min(max(normalizedPoint.x, 0), 1)
+        let clampedY = min(max(normalizedPoint.y, 0), 1)
         let frame = screen.frame
         return CGPoint(
             x: frame.minX + clampedX * frame.width,
@@ -1930,7 +2090,13 @@ private final class HandTracker: NSObject, AVCaptureVideoDataOutputSampleBufferD
             }
 
             self.session.beginConfiguration()
-            self.session.sessionPreset = .medium
+            if self.session.canSetSessionPreset(.hd1280x720) {
+                self.session.sessionPreset = .hd1280x720
+            } else if self.session.canSetSessionPreset(.high) {
+                self.session.sessionPreset = .high
+            } else {
+                self.session.sessionPreset = .medium
+            }
 
             guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front)
                 ?? AVCaptureDevice.default(for: .video)
@@ -2019,8 +2185,8 @@ private final class HandTracker: NSObject, AVCaptureVideoDataOutputSampleBufferD
             return false
         }
 
-        let visibleRect = CameraDisplayState.shared.visibleNormalizedRect
-        let relaxedVisibleRect = visibleRect
+        let cameraRect = CGRect(x: 0, y: 0, width: 1, height: 1)
+        let relaxedVisibleRect = cameraRect
             .insetBy(dx: -handEdgeMargin, dy: -handEdgeMargin)
             .intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
         let centerSafeRect = relaxedVisibleRect.insetBy(
@@ -2031,7 +2197,7 @@ private final class HandTracker: NSObject, AVCaptureVideoDataOutputSampleBufferD
             return false
         }
 
-        let visiblePointCount = hand.points.values.filter { visibleRect.contains($0) }.count
+        let visiblePointCount = hand.points.values.filter { cameraRect.contains($0) }.count
         let requiredVisiblePoints = max(6, Int(Double(hand.points.count) * 0.48))
         return visiblePointCount >= requiredVisiblePoints
     }
@@ -2085,7 +2251,7 @@ private final class CameraPreviewView: NSView {
         }
 
         let imageSize = CGSize(width: frameImage.width, height: frameImage.height)
-        let imageRect = aspectFillRect(contentSize: imageSize, in: bounds)
+        let imageRect = aspectFitRect(contentSize: imageSize, in: bounds)
         CameraDisplayState.shared.updateVisibleNormalizedRect(imageRect: imageRect, bounds: bounds)
 
         context.saveGState()
@@ -2193,15 +2359,11 @@ private final class SkeletonOverlayView: NSView {
         if isPinchedPose(hand) {
             gesture = now <= pointerReadoutUntil ? .pointerPinch : .fist
         }
-        if gesture == .fist,
-           !isPinchedPose(hand),
-           hand.point(.indexTip) != nil,
-           now <= pointerReadoutUntil {
-            gesture = .pointer
-        }
 
         guard gesture != .none,
-              let anchor = gesture == .pointer || gesture == .pointerPinch ? hand.point(.indexTip) : hand.center
+              let anchor = gesture == .pointer || gesture == .pointerPinch
+                ? thumbIndexAnchorPoint(for: hand)
+                : hand.center
         else {
             return
         }
@@ -2221,7 +2383,7 @@ private final class SkeletonOverlayView: NSView {
     }
 
     private func convertVisionPoint(_ point: CGPoint) -> CGPoint {
-        let rect = aspectFillRect(contentSize: videoFrameSize ?? bounds.size, in: bounds)
+        let rect = aspectFitRect(contentSize: videoFrameSize ?? bounds.size, in: bounds)
         let displayed = displayPoint(point)
         return CGPoint(x: rect.minX + displayed.x * rect.width, y: rect.minY + displayed.y * rect.height)
     }
@@ -2508,20 +2670,17 @@ private final class SettingsOverlayView: NSView {
     private let titleLabel = NSTextField(labelWithString: "Mac Hand Controller Setup")
     private let statusLabel = NSTextField(labelWithString: "AX:checking")
     private let bodyLabel = NSTextField(wrappingLabelWithString: "")
-    private let versionLabel = NSTextField(labelWithString: "v1.1 (One-Hand Mode)")
+    private let versionLabel = NSTextField(labelWithString: "v1.2 (Thumb-Index Pointer)")
     private let openAccessibilityButton = NSButton(title: "Open Accessibility Settings", target: nil, action: nil)
     private let doneButton = NSButton(title: "Done", target: nil, action: nil)
-    private let pointerToggle = NSButton(checkboxWithTitle: "Pointer: extend index finger", target: nil, action: nil)
+    private let pointerToggle = NSButton(checkboxWithTitle: "Pointer: thumb + index L-shape", target: nil, action: nil)
     private let clickToggle = NSButton(checkboxWithTitle: "Click: single pinch for left click, double pinch for right click", target: nil, action: nil)
     private let scrollToggle = NSButton(checkboxWithTitle: "Scroll: make a fist, move up/down", target: nil, action: nil)
     private let fullscreenToggle = NSButton(checkboxWithTitle: "Fullscreen: two-hand pinch spread/squeeze", target: nil, action: nil)
     private let spaceToggle = NSButton(checkboxWithTitle: "Space: one open-hand swipe left/right", target: nil, action: nil)
-    private let pointerSensitivityLabel = NSTextField(labelWithString: "Pointer sensitivity")
-    private let pointerSensitivityValueLabel = NSTextField(labelWithString: "")
-    private let pointerSensitivitySlider = NSSlider(value: 1.42, minValue: 0.70, maxValue: 2.40, target: nil, action: nil)
-    private let scrollSensitivityLabel = NSTextField(labelWithString: "Scroll sensitivity")
-    private let scrollSensitivityValueLabel = NSTextField(labelWithString: "")
-    private let scrollSensitivitySlider = NSSlider(value: 1.85, minValue: 0.50, maxValue: 3.00, target: nil, action: nil)
+    private let sensitivityLabel = NSTextField(labelWithString: "Gesture sensitivity")
+    private let sensitivityValueLabel = NSTextField(labelWithString: "")
+    private let sensitivitySlider = NSSlider(value: 1.55, minValue: 0.60, maxValue: 8.00, target: nil, action: nil)
     private let preferences = GesturePreferences.shared
 
     override init(frame frameRect: NSRect) {
@@ -2541,8 +2700,7 @@ private final class SettingsOverlayView: NSView {
         [
             titleLabel, versionLabel, statusLabel, bodyLabel, openAccessibilityButton,
             pointerToggle, clickToggle, scrollToggle, fullscreenToggle, spaceToggle,
-            pointerSensitivityLabel, pointerSensitivityValueLabel, pointerSensitivitySlider,
-            scrollSensitivityLabel, scrollSensitivityValueLabel, scrollSensitivitySlider,
+            sensitivityLabel, sensitivityValueLabel, sensitivitySlider,
             doneButton
         ].forEach {
             $0.translatesAutoresizingMaskIntoConstraints = false
@@ -2571,26 +2729,29 @@ private final class SettingsOverlayView: NSView {
             $0.action = #selector(toggleChanged)
             $0.font = .systemFont(ofSize: 13, weight: .medium)
         }
-        [pointerSensitivityLabel, scrollSensitivityLabel].forEach {
+        [sensitivityLabel].forEach {
             $0.font = .systemFont(ofSize: 13, weight: .semibold)
             $0.textColor = .labelColor
         }
-        [pointerSensitivityValueLabel, scrollSensitivityValueLabel].forEach {
+        [sensitivityValueLabel].forEach {
             $0.font = .monospacedSystemFont(ofSize: 12, weight: .medium)
             $0.textColor = .secondaryLabelColor
             $0.alignment = .right
         }
-        [pointerSensitivitySlider, scrollSensitivitySlider].forEach {
+        [sensitivitySlider].forEach {
             $0.target = self
             $0.action = #selector(sensitivityChanged)
             $0.numberOfTickMarks = 6
             $0.allowsTickMarkValuesOnly = false
         }
 
+        let panelWidth = panel.widthAnchor.constraint(equalTo: widthAnchor, multiplier: 0.85)
+        panelWidth.priority = .defaultHigh
+
         NSLayoutConstraint.activate([
             panel.centerXAnchor.constraint(equalTo: centerXAnchor),
             panel.centerYAnchor.constraint(equalTo: centerYAnchor),
-            panel.widthAnchor.constraint(equalToConstant: 620),
+            panelWidth,
             titleLabel.topAnchor.constraint(equalTo: panel.topAnchor, constant: 28),
             titleLabel.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 30),
 
@@ -2630,25 +2791,16 @@ private final class SettingsOverlayView: NSView {
             spaceToggle.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
             spaceToggle.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -30),
 
-            pointerSensitivityLabel.topAnchor.constraint(equalTo: spaceToggle.bottomAnchor, constant: 18),
-            pointerSensitivityLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
-            pointerSensitivityValueLabel.centerYAnchor.constraint(equalTo: pointerSensitivityLabel.centerYAnchor),
-            pointerSensitivityValueLabel.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -30),
-            pointerSensitivityValueLabel.widthAnchor.constraint(equalToConstant: 64),
-            pointerSensitivitySlider.topAnchor.constraint(equalTo: pointerSensitivityLabel.bottomAnchor, constant: 6),
-            pointerSensitivitySlider.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
-            pointerSensitivitySlider.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -30),
+            sensitivityLabel.topAnchor.constraint(equalTo: spaceToggle.bottomAnchor, constant: 18),
+            sensitivityLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
+            sensitivityValueLabel.centerYAnchor.constraint(equalTo: sensitivityLabel.centerYAnchor),
+            sensitivityValueLabel.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -30),
+            sensitivityValueLabel.widthAnchor.constraint(equalToConstant: 64),
+            sensitivitySlider.topAnchor.constraint(equalTo: sensitivityLabel.bottomAnchor, constant: 6),
+            sensitivitySlider.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
+            sensitivitySlider.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -30),
 
-            scrollSensitivityLabel.topAnchor.constraint(equalTo: pointerSensitivitySlider.bottomAnchor, constant: 14),
-            scrollSensitivityLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
-            scrollSensitivityValueLabel.centerYAnchor.constraint(equalTo: scrollSensitivityLabel.centerYAnchor),
-            scrollSensitivityValueLabel.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -30),
-            scrollSensitivityValueLabel.widthAnchor.constraint(equalToConstant: 64),
-            scrollSensitivitySlider.topAnchor.constraint(equalTo: scrollSensitivityLabel.bottomAnchor, constant: 6),
-            scrollSensitivitySlider.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
-            scrollSensitivitySlider.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -30),
-
-            doneButton.topAnchor.constraint(equalTo: scrollSensitivitySlider.bottomAnchor, constant: 22),
+            doneButton.topAnchor.constraint(equalTo: sensitivitySlider.bottomAnchor, constant: 22),
             doneButton.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -30),
             doneButton.widthAnchor.constraint(equalToConstant: 96),
             doneButton.heightAnchor.constraint(equalToConstant: 34),
@@ -2667,13 +2819,13 @@ private final class SettingsOverlayView: NSView {
         let access = MacActionRunner.hasAccessibilityPermission
         statusLabel.stringValue = access ? "AX:on / gestures ready" : "AX:off / waiting for Accessibility permission"
         bodyLabel.stringValue = access
-            ? "Choose which gesture groups are active. You can reopen this panel from the Settings button in the top-left corner."
+            ? "Pointer uses the space between your thumb and index finger. Pinch from that pose to click. You can reopen this panel from the Settings button."
             : "Accessibility permission is required before Mac Hand Controller can move the mouse, click, switch Spaces, or control windows. Open System Settings and enable Mac Hand Controller, then return here."
         openAccessibilityButton.isHidden = access
         doneButton.isEnabled = access
         [
             pointerToggle, clickToggle, scrollToggle, fullscreenToggle, spaceToggle,
-            pointerSensitivitySlider, scrollSensitivitySlider
+            sensitivitySlider
         ].forEach {
             $0.isEnabled = access
         }
@@ -2685,8 +2837,7 @@ private final class SettingsOverlayView: NSView {
         scrollToggle.state = preferences.scrollEnabled ? .on : .off
         fullscreenToggle.state = preferences.fullscreenEnabled ? .on : .off
         spaceToggle.state = preferences.spaceEnabled ? .on : .off
-        pointerSensitivitySlider.doubleValue = preferences.pointerSensitivity
-        scrollSensitivitySlider.doubleValue = preferences.scrollSensitivity
+        sensitivitySlider.doubleValue = preferences.gestureSensitivity
         updateSensitivityLabels()
     }
 
@@ -2711,14 +2862,12 @@ private final class SettingsOverlayView: NSView {
     }
 
     @objc private func sensitivityChanged() {
-        preferences.pointerSensitivity = pointerSensitivitySlider.doubleValue
-        preferences.scrollSensitivity = scrollSensitivitySlider.doubleValue
+        preferences.gestureSensitivity = sensitivitySlider.doubleValue
         updateSensitivityLabels()
     }
 
     private func updateSensitivityLabels() {
-        pointerSensitivityValueLabel.stringValue = String(format: "%.2fx", preferences.pointerSensitivity)
-        scrollSensitivityValueLabel.stringValue = String(format: "%.2fx", preferences.scrollSensitivity)
+        sensitivityValueLabel.stringValue = String(format: "%.2fx", preferences.gestureSensitivity)
     }
 }
 
@@ -2849,7 +2998,7 @@ private final class RootViewController: NSViewController {
         }
 
         didLockCameraAspectRatio = true
-        let aspectRatio: CGFloat = 16 / 9
+        let aspectRatio = max(CGFloat(width) / CGFloat(height), 0.1)
         window.contentAspectRatio = NSSize(width: aspectRatio, height: 1)
 
         let currentContentSize = window.contentLayoutRect.size
@@ -2857,11 +3006,15 @@ private final class RootViewController: NSViewController {
             return
         }
 
-        window.setContentSize(NSSize(width: currentContentSize.width, height: currentContentSize.width / aspectRatio))
+        let newContentSize = NSSize(width: currentContentSize.width, height: currentContentSize.width / aspectRatio)
+        var frame = window.frameRect(forContentRect: NSRect(origin: .zero, size: newContentSize))
+        frame.origin.x = window.frame.maxX - frame.width
+        frame.origin.y = window.frame.maxY - frame.height
+        window.setFrame(frame, display: true)
     }
 }
 
-private final class AppDelegate: NSObject, NSApplicationDelegate {
+private final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let tracker = HandTracker()
     private let actionRunner = MacActionRunner()
     private var window: NSWindow?
@@ -2949,7 +3102,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         window.backgroundColor = .black
         window.minSize = NSSize(width: 80, height: 80)
         window.contentMinSize = NSSize(width: 1, height: 1)
+        window.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        window.delegate = self
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
         window.orderFrontRegardless()
@@ -2959,8 +3114,29 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func defaultDebugWindowFrame() -> NSRect {
         let visibleFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1280, height: 720)
-        let width = min(980, max(420, visibleFrame.width * 0.62))
+        let margin: CGFloat = 24
+        let width = min(520, max(360, visibleFrame.width * 0.30))
         let height = width * 9 / 16
+        return NSRect(
+            x: visibleFrame.maxX - width - margin,
+            y: visibleFrame.maxY - height - margin,
+            width: width,
+            height: height
+        )
+    }
+
+    func windowWillUseStandardFrame(_ window: NSWindow, defaultFrame newFrame: NSRect) -> NSRect {
+        let visibleFrame = window.screen?.visibleFrame ?? NSScreen.main?.visibleFrame ?? newFrame
+        let aspectRatio = window.contentAspectRatio.width > 0 && window.contentAspectRatio.height > 0
+            ? window.contentAspectRatio.width / window.contentAspectRatio.height
+            : 16 / 9
+        return largestAspectFrame(in: visibleFrame, aspectRatio: aspectRatio)
+    }
+
+    private func largestAspectFrame(in visibleFrame: NSRect, aspectRatio: CGFloat) -> NSRect {
+        let widthFromHeight = visibleFrame.height * aspectRatio
+        let width = min(visibleFrame.width, widthFromHeight)
+        let height = width / aspectRatio
         return NSRect(
             x: visibleFrame.midX - width / 2,
             y: visibleFrame.midY - height / 2,
