@@ -1,5 +1,11 @@
 # Mac Hand Controller
 
+<!-- PROJECT-PRESENTATION:START -->
+<a href="https://github.com/minwoo19930301/mac-hand-control"><img src="Docs/gesture-guide.png" alt="Mac Hand Controller" width="960"></a>
+
+[![QUICK START](https://img.shields.io/badge/QUICK%20START-374151?style=for-the-badge)](#install-from-release) [![SOURCE](https://img.shields.io/badge/SOURCE-444444?style=for-the-badge)](https://github.com/minwoo19930301/mac-hand-control)
+<!-- PROJECT-PRESENTATION:END -->
+
 Native macOS prototype for controlling Spaces and fullscreen with camera hand gestures.
 
 ![Mac Hand Controller gesture guide](Docs/gesture-guide.png)
