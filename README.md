@@ -1,95 +1,44 @@
+<p align="center">
+  <a href="https://github.com/minwoo19930301/mac-hand-control/releases/latest/download/Mac-Hand-Controller.dmg"><img src="https://img.shields.io/badge/DOWNLOAD%20DMG-latest-2F7BF6?style=for-the-badge&labelColor=111111" alt="Download DMG"></a>
+</p>
+
 # Mac Hand Controller
 
-<!-- PROJECT-PRESENTATION:START -->
-<a href="https://github.com/minwoo19930301/mac-hand-control"><img src="Docs/gesture-guide.png" alt="Mac Hand Controller" width="960"></a>
+Control your Mac with hand gestures in front of the camera.
 
-[![QUICK START](https://img.shields.io/badge/QUICK%20START-374151?style=for-the-badge)](#install-from-release) [![SOURCE](https://img.shields.io/badge/SOURCE-444444?style=for-the-badge)](https://github.com/minwoo19930301/mac-hand-control)
-<!-- PROJECT-PRESENTATION:END -->
-
-Native macOS prototype for controlling Spaces and fullscreen with camera hand gestures.
-
-![Mac Hand Controller gesture guide](Docs/gesture-guide.png)
+<table>
+  <tr>
+    <td width="70%"><img src="Docs/gesture-guide.png" alt="Gesture guide"></td>
+    <td width="30%" align="center"><img src="Docs/app-icon.png" alt="App icon" width="180"></td>
+  </tr>
+</table>
 
 ## Gestures
 
-- Fullscreen: pinch with both hands, keep pinching, then spread or squeeze the two hands. This sends `Control + Command + F` to the app you were using.
-- Move pointer: raise one hand with the index finger extended. Small moves stay precise; larger moves accelerate.
-- Left click: pinch right after pointer mode.
-- Right click: double pinch right after pointer mode.
-- Scroll: make a fist and move up or down. After one direction starts, the opposite direction is briefly ignored.
+| Gesture | Action |
+| --- | --- |
+| Pinch with both hands, then spread or squeeze | Toggle fullscreen (`Ctrl + Cmd + F`) |
+| Open palm, swipe left or right | Switch Space (`Ctrl + ←/→`) |
+| Make an L with thumb and index finger | Move the pointer |
+| Pinch while pointing | Left click |
+| Double pinch while pointing | Right click |
+| Make a fist and move up or down | Scroll |
 
-The debug panel shows a mirrored camera feed, hand skeletons, and markers for pinch, open, fist, and pointer poses.
+Each gesture can be turned off in the app.
 
-## Install From Release
+## Install
 
-Download the latest `Mac-Hand-Controller.dmg` or `Mac-Hand-Controller.zip` from the GitHub Releases page:
+1. Click **DOWNLOAD DMG** above.
+2. Open the DMG and drag `Mac Hand Controller.app` into `Applications`.
+3. Launch it, allow camera access, and turn on Accessibility from the in-app setup panel.
 
-https://github.com/minwoo19930301/mac-hand-control/releases
+It's not notarized. If macOS blocks it, go to System Settings → Privacy & Security and click **Open Anyway**.
 
-DMG is the friendlier install path. Open `Mac-Hand-Controller.dmg`, then drag `Mac Hand Controller.app` into `Applications`.
-
-If you download the zip instead, unzip it and move `Mac Hand Controller.app` into `Applications`. Open the app, approve camera access, and use the in-app setup panel to enable Accessibility control.
-
-Because this prototype is ad-hoc signed instead of Developer ID signed and notarized, macOS may ask for approval in Privacy & Security the first time you open a downloaded copy.
-
-If macOS says the app cannot be checked for malicious software:
-
-1. Try to open `Mac Hand Controller.app` once.
-2. Open System Settings.
-3. Go to Privacy & Security.
-4. In the Security section, click Open Anyway for Mac Hand Controller.
-5. Open the app again and confirm Open.
-
-This manual approval is only needed because the prototype is not notarized. The cleaner distribution path is to sign the app with an Apple Developer ID certificate, enable hardened runtime, submit it to Apple's notary service, staple the notarization ticket, and then build the DMG.
-
-## Build Locally
+## Build
 
 ```sh
-./build.sh
+./build.sh     # build/Mac Hand Controller.app
+./package.sh   # dist/Mac-Hand-Controller.dmg
 ```
 
-The build script creates:
-
-```txt
-build/Mac Hand Controller.app
-```
-
-## Package A DMG
-
-```sh
-./package.sh
-```
-
-The package script builds the app and creates:
-
-```txt
-dist/Mac-Hand-Controller.dmg
-```
-
-## Distribution
-
-For a smoother public install, the next step is signing with an Apple Developer ID certificate and notarizing the DMG. Without that, the app still works, but macOS will show extra security prompts after download.
-
-### Signed Release
-
-After a `Developer ID Application` certificate is installed in Keychain Access, confirm the signing identity:
-
-```sh
-security find-identity -v -p codesigning
-```
-
-Store Apple notarization credentials once:
-
-```sh
-xcrun notarytool store-credentials "mac-hand-control-notary" \
-  --apple-id "you@example.com" \
-  --team-id "TEAMID"
-```
-
-Then build, sign, notarize, and staple the DMG:
-
-```sh
-SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" \
-NOTARY_PROFILE="mac-hand-control-notary" \
-./release.sh
-```
+For a signed and notarized release, see `release.sh`.
